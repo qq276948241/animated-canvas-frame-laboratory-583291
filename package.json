@@ -8,5 +8,8 @@
     "type": "git",
     "url": "https://github.com/deanm/omggif"
   },
-  "main": "omggif.js"
+  "main": "omggif.js",
+  "scripts": {
+    "test": "node test/run_tests.js"
+  }
 }

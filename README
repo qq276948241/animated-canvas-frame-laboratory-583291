@@ -3,6 +3,47 @@ omggif is a JavaScript implementation of a GIF 89a encoder and decoder.
 https://github.com/deanm/omggif
 
 
+Decoding semantics (explicit, not guessed)
+------------------------------------------
+
+- `GifReader` exposes the indexed-frame API (`frameInfo`,
+  `decodeAndBlitFrameRGBA/BGRA`) and `GifCompositor` provides logical-canvas
+  compositing: `compositeFrame(n)` returns the full RGBA canvas as it should
+  be displayed while frame n is shown.
+- A Graphics Control Extension applies to exactly one frame.  A frame
+  without its own GCE gets the defaults: delay 0, no transparency,
+  disposal 0 ("no disposal specified", composited as "leave in place").
+- `loopCount()` returns `null` when the file has no Netscape looping block,
+  meaning "play once".  Only an explicit block yields a number
+  (0 = loop forever).
+- Disposal: 0/1 (and reserved 4-7) leave the canvas in place; 2 clears the
+  frame's rectangle to transparent; 3 restores the canvas to what it was
+  before that frame.  A frame's disposal is applied when advancing past it.
+  Transparent pixels never overwrite the canvas below them.
+- Frames extending outside the logical screen are clipped by
+  `GifCompositor`; the raw `decodeAndBlitFrame*` API rejects them instead.
+- `compositeFrame(n)` is idempotent: repeated calls for the same frame
+  return the same canvas and never accumulate on the cached state.
+- Stable errors are raised before any pixel is written when a frame
+  rectangle does not fit the logical screen, when a palette index is out of
+  range, or when a frame has no color table.  Truncated extensions raise
+  stable parse errors.
+
+
+Tests
+-----
+
+The test suite uses offline minimal GIF fixtures (test/fixtures/, generated
+by test/gen_fixtures.js) and an independent per-pixel compositing reference
+(test/reference.js) that shares no code with omggif.js.  Assertions are on
+decoded canvas pixels and frame metadata, covering disposal 0/1/2/3,
+missing/local palettes, transparent edges, out-of-canvas frames, truncated
+extensions, interlaced pass order, and repeated compositor reuse.
+
+    node test/gen_fixtures.js   # regenerate fixtures (already committed)
+    node test/run_tests.js      # run the suite
+
+
 (c) Dean McNamee <dean@gmail.com>, 2013.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

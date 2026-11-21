@@ -141,6 +141,18 @@ function GifWriter(buf, width, height, gopts) {
     while (num_colors >>= 1) ++min_code_size;
     num_colors = 1 << min_code_size;  // Now we can easily get it back.
 
+    // Validate the pixel indices up front: out-of-range indices would be
+    // silently masked by the LZW encoder and decode to a different picture.
+    var num_frame_pixels = w * h;
+    for (var i = 0; i < num_frame_pixels; ++i) {
+      var pix_index = indexed_pixels[i];
+      if ((pix_index | 0) !== pix_index ||
+          pix_index < 0 || pix_index >= num_colors)
+        throw new Error(
+            "Pixel index " + pix_index + " out of range for a palette of " +
+            num_colors + " colors.");
+    }
+
     var delay = opts.delay === undefined ? 0 : opts.delay;
 
     // From the spec:
@@ -363,6 +375,82 @@ function GifWriterOutputLZWCodeStream(buf, p, min_code_size, index_stream) {
   return p;
 }
 
+// Validate that a frame rectangle lies inside the logical screen.  This must
+// be checked before any pixel is written, so callers get a stable error
+// instead of a corrupt canvas.  Frames that exceed the canvas are rejected
+// here; GifCompositor instead clips them to the canvas (documented rule).
+function GifReaderCheckFrameRect(frame, width, height) {
+  if (frame.x < 0 || frame.y < 0 ||
+      frame.x + frame.width > width || frame.y + frame.height > height) {
+    throw new Error(
+        "Frame rectangle (" + frame.x + "," + frame.y + " " +
+        frame.width + "x" + frame.height + ") does not fit within the " +
+        "logical screen (" + width + "x" + height + ").");
+  }
+}
+
+// Validate a decoded index stream against the frame's palette before any
+// pixel is written.  Throws stable errors on out-of-range data.
+function GifReaderCheckFramePalette(frame, index_stream) {
+  if (frame.palette_offset === null)
+    throw new Error("Frame has no color table (neither global nor local).");
+  var trans = frame.transparent_index === null ? 256 : frame.transparent_index;
+  for (var i = 0, il = index_stream.length; i < il; ++i) {
+    var index = index_stream[i];
+    // The transparent index is never looked up in the palette, so it is
+    // allowed to be out of range (some encoders emit 0 with no palette use).
+    if (index !== trans && index >= frame.palette_size) {
+      throw new Error(
+          "Palette index " + index + " out of range " +
+          "(palette size " + frame.palette_size + ").");
+    }
+  }
+}
+
+// Decode a frame to its own RGBA buffer (frame.width x frame.height), with
+// transparent pixels left as alpha 0.  Interlaced frames are deinterlaced
+// following the GIF 4-pass row order.  This does not composite onto the
+// logical screen; see GifCompositor for canvas-level compositing.
+function GifReaderDecodeFrameToRGBA(buf, frame) {
+  var framewidth = frame.width, frameheight = frame.height;
+  var num_pixels = framewidth * frameheight;
+  var index_stream = new Uint8Array(num_pixels);  // At most 8-bit indices.
+  GifReaderLZWOutputIndexStream(
+      buf, frame.data_offset, index_stream, num_pixels);
+
+  // Validate before writing any pixel.
+  GifReaderCheckFramePalette(frame, index_stream);
+
+  var pixels = new Uint8Array(num_pixels * 4);
+  var palette_offset = frame.palette_offset;
+  var trans = frame.transparent_index === null ? 256 : frame.transparent_index;
+
+  // Row traversal order: interlaced images store rows in 4 passes
+  // (starting rows 0/4/2/1 with steps 8/8/4/2), otherwise top to bottom.
+  var passes = frame.interlaced === true ?
+      [[0, 8], [4, 8], [2, 4], [1, 2]] : [[0, 1]];
+
+  var src = 0;
+  for (var pass = 0; pass < passes.length; ++pass) {
+    var row_start = passes[pass][0], row_step = passes[pass][1];
+    for (var row = row_start; row < frameheight; row += row_step) {
+      var op = row * framewidth * 4;
+      for (var col = 0; col < framewidth; ++col) {
+        var index = index_stream[src++];
+        if (index !== trans) {
+          pixels[op++] = buf[palette_offset + index * 3];
+          pixels[op++] = buf[palette_offset + index * 3 + 1];
+          pixels[op++] = buf[palette_offset + index * 3 + 2];
+          pixels[op++] = 255;
+        } else {
+          op += 4;  // Transparent: leave as 0,0,0,0.
+        }
+      }
+    }
+  }
+  return pixels;
+}
+
 function GifReader(buf) {
   var p = 0;
 
@@ -505,6 +593,15 @@ function GifReader(buf) {
                      interlaced: !!interlace_flag,
                      delay: delay,
                      disposal: disposal});
+
+        // Per the GIF89a spec, a Graphics Control Extension applies only to
+        // the single graphic block that immediately follows it.  Reset the
+        // carried state so a GCE never leaks into subsequent frames; frames
+        // without their own GCE get the explicit defaults (delay 0, no
+        // transparency, disposal 0 "no disposal specified").
+        delay = 0;
+        transparent_index = null;
+        disposal = 0;
         break;
 
       case 0x3b:  // Trailer Marker (end of file).
@@ -538,6 +635,10 @@ function GifReader(buf) {
     GifReaderLZWOutputIndexStream(
         buf, frame.data_offset, index_stream, num_pixels);
     var palette_offset = frame.palette_offset;
+
+    // Validate before writing any pixel into the caller's canvas.
+    GifReaderCheckFrameRect(frame, width, height);
+    GifReaderCheckFramePalette(frame, index_stream);
 
     // NOTE(deanm): It seems to be much faster to compare index to 256 than
     // to === null.  Not sure why, but CompareStub_EQ_STRICT shows up high in
@@ -607,6 +708,10 @@ function GifReader(buf) {
         buf, frame.data_offset, index_stream, num_pixels);
     var palette_offset = frame.palette_offset;
 
+    // Validate before writing any pixel into the caller's canvas.
+    GifReaderCheckFrameRect(frame, width, height);
+    GifReaderCheckFramePalette(frame, index_stream);
+
     // NOTE(deanm): It seems to be much faster to compare index to 256 than
     // to === null.  Not sure why, but CompareStub_EQ_STRICT shows up high in
     // the profile, not sure if it's related to using a Uint8Array.
@@ -664,6 +769,134 @@ function GifReader(buf) {
       }
       --xleft;
     }
+  };
+
+  // Decode a single frame into its own RGBA buffer (frame.width x
+  // frame.height pixels), honoring the interlace pass order.  Transparent
+  // pixels are left as 0,0,0,0.  Throws a stable error before writing any
+  // pixel if the palette is missing or a palette index is out of range.
+  this.decodeFrameRGBA = function(frame_num) {
+    var frame = this.frameInfo(frame_num);
+    return GifReaderDecodeFrameToRGBA(buf, frame);
+  };
+}
+
+// Canvas-level compositor for animated GIFs.  Unlike decodeAndBlitFrameRGBA
+// (which blits a single frame's rectangle into a caller buffer), the
+// compositor maintains the logical screen across frames and applies the GIF
+// disposal rules, so compositeFrame(n) returns the full canvas as it should
+// be displayed while frame n is shown.
+//
+// Explicit semantics (documented, not guessed):
+//  - The canvas starts fully transparent (0,0,0,0).
+//  - disposal 0 (unspecified) and 1 are both treated as "leave in place",
+//    matching common decoder practice; reserved values 4-7 are treated the
+//    same.  disposal 2 restores the frame's rectangle to transparent.
+//    disposal 3 restores the canvas to what it was before that frame was
+//    drawn.  A frame's disposal is applied when advancing past it.
+//  - Transparent pixels of a frame never overwrite the canvas below them.
+//  - Frames extending outside the logical screen are clipped to it (the
+//    raw decodeAndBlitFrame* API instead rejects such frames).
+//  - compositeFrame(n) is idempotent: calling it repeatedly for the same n
+//    returns the same canvas and never accumulates on the cached state.
+//    Frames are decoded at most once per advance; seeking backwards replays
+//    from the first frame.
+function GifCompositor(reader) {
+  var width = reader.width;
+  var height = reader.height;
+  if (!(width > 0) || !(height > 0))
+    throw new Error("Invalid logical screen size.");
+
+  var canvas = new Uint8Array(width * height * 4);  // Starts transparent.
+  var saved_canvas = null;  // Snapshot for the current frame's disposal 3.
+  var current = -1;  // Index of the last composited frame.
+
+  this.width = width;
+  this.height = height;
+
+  // Frame rectangle clipped to the logical screen, or null if no overlap.
+  function clippedRect(frame) {
+    var x0 = frame.x > 0 ? frame.x : 0;
+    var y0 = frame.y > 0 ? frame.y : 0;
+    var x1 = Math.min(frame.x + frame.width, width);
+    var y1 = Math.min(frame.y + frame.height, height);
+    if (x1 <= x0 || y1 <= y0) return null;
+    return {x: x0, y: y0, width: x1 - x0, height: y1 - y0};
+  }
+
+  function clearRect(r) {
+    for (var row = 0; row < r.height; ++row) {
+      var op = ((r.y + row) * width + r.x) * 4;
+      canvas.fill(0, op, op + r.width * 4);
+    }
+  }
+
+  // Apply the disposal of the frame that was just left, per GIF89a rules.
+  function applyDisposal(frame) {
+    switch (frame.disposal) {
+      case 2:  // Restore to background: clear the frame's rectangle.
+        var r = clippedRect(frame);
+        if (r !== null) clearRect(r);
+        break;
+      case 3:  // Restore to previous: put back what the frame overwrote.
+        if (saved_canvas !== null) {
+          canvas.set(saved_canvas);
+          saved_canvas = null;
+        }
+        break;
+      default:  // 0, 1 and reserved 4-7: leave the canvas in place.
+        break;
+    }
+  }
+
+  function drawFrame(frame_num) {
+    var frame = reader.frameInfo(frame_num);
+    // Save the pre-frame canvas so disposal 3 can restore it later.
+    if (frame.disposal === 3) saved_canvas = canvas.slice();
+    var r = clippedRect(frame);
+    if (r === null) return;  // Fully outside the canvas: nothing to draw.
+    var img = reader.decodeFrameRGBA(frame_num);
+    var sx0 = r.x - frame.x, sy0 = r.y - frame.y;
+    for (var row = 0; row < r.height; ++row) {
+      var sp = ((sy0 + row) * frame.width + sx0) * 4;
+      var dp = ((r.y + row) * width + r.x) * 4;
+      for (var col = 0; col < r.width; ++col) {
+        if (img[sp + 3] !== 0) {  // Transparent pixels never overwrite.
+          canvas[dp]     = img[sp];
+          canvas[dp + 1] = img[sp + 1];
+          canvas[dp + 2] = img[sp + 2];
+          canvas[dp + 3] = 255;
+        }
+        sp += 4; dp += 4;
+      }
+    }
+  }
+
+  // Composite up to and including frame |frame_num| and return a copy of
+  // the logical canvas (RGBA, width*height*4).  The returned buffer is a
+  // fresh copy; mutating it does not affect the compositor's state.
+  this.compositeFrame = function(frame_num) {
+    if (frame_num < 0 || frame_num >= reader.numFrames())
+      throw new Error("Frame index out of range.");
+    if (frame_num === current) return canvas.slice();  // No re-accumulation.
+    if (frame_num < current) {  // Seeking backwards: replay from scratch.
+      canvas.fill(0);
+      saved_canvas = null;
+      current = -1;
+    }
+    while (current < frame_num) {
+      if (current >= 0) applyDisposal(reader.frameInfo(current));
+      ++current;
+      drawFrame(current);
+    }
+    return canvas.slice();
+  };
+
+  // Reset the compositor to the empty canvas (as if newly constructed).
+  this.reset = function() {
+    canvas.fill(0);
+    saved_canvas = null;
+    current = -1;
   };
 }
 
@@ -812,4 +1045,8 @@ function GifReaderLZWOutputIndexStream(code_stream, p, output, output_length) {
 }
 
 // CommonJS.
-try { exports.GifWriter = GifWriter; exports.GifReader = GifReader } catch(e) {}
+try {
+  exports.GifWriter = GifWriter;
+  exports.GifReader = GifReader;
+  exports.GifCompositor = GifCompositor;
+} catch(e) {}
